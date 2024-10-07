@@ -5,45 +5,139 @@
 */
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>  
 #include <mpi.h>
 #include <pthread.h> 
 #include <unistd.h>
 #include <semaphore.h>
 #include <time.h>
 
-#define BUFFER_SIZE 4 // Númermo máximo de relogios enfileirados
 
-typedef struct Clock { 
-   int p[3];
-   int receiver;
+#define BUFFER_SIZE 4 //tamanho das filas
+
+typedef struct Clock {
+    int p[3];
+    int receiver;
 } Clock;
 
 //filas
 Clock rcv[BUFFER_SIZE];
 Clock snd[BUFFER_SIZE];
 
-//contadores
+//contadores de relogios das filas
 int rcv_count = 0;
 int snd_count = 0;
 
-//mutexes
-pthread_mutex_t mtx_rcv = PTHREAD_MUTEX_INITIALIZER;;
-pthread_mutex_t mtx_send = PTHREAD_MUTEX_INITIALIZER;;
-pthread_mutex_t mtx_clock = PTHREAD_MUTEX_INITIALIZER;;
+//mutexes 
+pthread_mutex_t mtx_rcv = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t mtx_snd = PTHREAD_MUTEX_INITIALIZER;
 
-//variaveis de condição
+//variáveis de condição
 pthread_cond_t rcv_empty;
 pthread_cond_t rcv_full;
 pthread_cond_t snd_empty;
 pthread_cond_t snd_full;
 
 //funções das threads
-void *receiveClock(void *args); //função thread 1
-void *mainThread(void *args); //função thread 2
-void *sendClock(void *args); //função thread 3
+void* receivingThread(void* args);
+void* mainThread(void* args);
+void* sendingThread(void* args);
 
+//clock do processo
 Clock my_clock = {{0, 0, 0}, -1};
+
+//processo mostra seu próprio relógio (debug)
+void printMyClock(int pid) {
+    printf("%d: my clock is (%d,%d,%d)\n", pid, my_clock.p[0], my_clock.p[1], my_clock.p[2]);
+
+}
+//evento do processo pid
+void event(int pid) {
+    my_clock.p[pid]++;
+}
+
+//salva relógio recebido como parametro na fila de recebidos
+void queueRcv(Clock clock) {
+    pthread_mutex_lock(&mtx_rcv);
+    
+    while (rcv_count == BUFFER_SIZE) {
+        printf("Buffer de recebimento cheio!\n");
+        pthread_cond_wait(&rcv_full, &mtx_rcv);
+    }
+    
+    rcv[rcv_count] = clock;
+    rcv_count++;
+    
+    pthread_mutex_unlock(&mtx_rcv);
+    pthread_cond_signal(&rcv_empty);
+    
+}
+
+//pega relogio na fila de recebidos e compara com relogio interno do processo
+void compare(int pid) {
+    pthread_mutex_lock(&mtx_rcv);
+    
+    while (rcv_count == 0) {
+        pthread_cond_wait(&rcv_empty, &mtx_rcv);
+    }
+    
+    Clock newClock = rcv[0];
+    int i;
+    for (i = 0; i < rcv_count-1; i++) {
+        rcv[i] = rcv[i+1];
+    }
+    rcv_count--;
+    
+    pthread_mutex_unlock(&mtx_rcv);
+    pthread_cond_signal(&rcv_full);
+    
+    for (i=0; i<3; i++) {
+        if (my_clock.p[i] < newClock.p[i]) {
+            my_clock.p[i] = newClock.p[i];
+        }
+    }
+    
+    my_clock.p[pid]++;
+}
+
+//salva relogio do processo na fila de envio
+void queueSnd(int pid, int receiver) {
+    my_clock.p[pid]++;
+    
+    pthread_mutex_lock(&mtx_snd);
+    
+    while (snd_count == BUFFER_SIZE) {
+        printf("Buffer de envio cheio!\n");
+        pthread_cond_wait(&snd_full, &mtx_snd);
+    }
+    
+    Clock temp = my_clock;
+    temp.receiver = receiver;
+    snd[snd_count] = temp;
+    snd_count++;
+    
+    pthread_mutex_unlock(&mtx_snd);
+    pthread_cond_signal(&snd_empty);
+}
+
+//retorna um relogio da fila de envio
+Clock send() {
+    pthread_mutex_lock(&mtx_snd);
+    
+    while(snd_count == 0) {
+        pthread_cond_wait(&snd_empty, &mtx_snd);
+    }
+    
+    Clock clock = snd[0];
+    for (int i=0; i<snd_count-1; i++) {
+        snd[i] = snd[i+1];
+    }
+    snd_count--;
+    
+    pthread_mutex_unlock(&mtx_snd);
+    pthread_cond_signal(&snd_full);
+    
+    return clock;
+}
 
 int main() {
     int my_rank;
@@ -52,18 +146,29 @@ int main() {
     
     MPI_Comm_rank(MPI_COMM_WORLD, &my_rank);
     
-    //inicializa variaveis de condição
+    //inicializa variáveis de condição
     pthread_cond_init(&rcv_empty, NULL);
     pthread_cond_init(&rcv_full, NULL);
     pthread_cond_init(&snd_empty, NULL);
     pthread_cond_init(&snd_full, NULL);
-  
+    
     pthread_t thread1, thread2, thread3;
- 
-    pthread_create(&thread1, NULL, receiveClock, (void *)(long)my_rank);
-    pthread_create(&thread2, NULL, mainThread, (void *)(long)my_rank);
-    pthread_create(&thread3, NULL, sendClock, (void *)(long)my_rank);
-
+    
+    // inicializa thread de entrada
+    if (pthread_create(&thread1, NULL, &receivingThread, (void*)(long)my_rank) != 0) {
+         perror("Failed to create thread 1");
+    }
+    
+    // inicializa thread principal
+    if (pthread_create(&thread2, NULL, &mainThread, (void*)(long)my_rank) != 0) {
+         perror("Failed to create thread 2");
+    } 
+    
+    // inicializa thread de saída
+    if (pthread_create(&thread3, NULL, &sendingThread, (void*)(long)my_rank) != 0) {
+         perror("Failed to create thread 3");
+    }
+    
     pthread_join(thread1, NULL);
     pthread_join(thread2, NULL);
     pthread_join(thread3, NULL);
@@ -79,156 +184,62 @@ int main() {
     return 0;
 }
 
-/* -----------------------------------------------------------------------------*/
 
-void event(int pid){
-   pthread_mutex_lock(&mtx_clock);
-   my_clock.p[pid]++;
-   printf("Processo %d fez evento: (%d, %d, %d)\n", pid, my_clock.p[0], my_clock.p[1], my_clock.p[2]);
-   pthread_mutex_unlock(&mtx_clock);
+/*---------------------------------------------------------*/
+
+//recebe relogios de outros processos
+void* receivingThread(void* args) {
+    int my_rank = (int)((long)args);
+    Clock clock;
+
+    while (1) {
+        MPI_Recv(&clock, sizeof(Clock), MPI_BYTE, MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        queueRcv(clock);
+    }
+
+    return NULL;
 }
 
-void receive(int pid) {
-    
-    pthread_mutex_lock(&mtx_rcv);//bloqueia fila de recebimento
-
-    while (rcv_count == 0){
-        printf("O BUFFER DE RECEBIMENTO DE %d ESTA VAZIO\n", pid);
-        pthread_cond_wait(&rcv_empty, &mtx_rcv); // Libera mutex mtx_rcv e fica bloqueado na variável rcv_empty
-    }
-    
-    Clock clock = rcv[0];
-    for (int i=0; i<rcv_count-1; i++) {
-        rcv[i] = rcv[i+1];
-    }
-    rcv_count--;
-    pthread_mutex_unlock(&mtx_rcv);//desbloqueia fila de recebimento
-    pthread_cond_signal(&rcv_full); //desbloqueia thread 1
-    
-    pthread_mutex_lock(&mtx_clock);
-    my_clock.p[pid]++;
-    // Atualizar o relógio local para ser o máximo entre o atual e o recebido
-    for (int i = 0; i < 3; i++) {
-    
-        if (my_clock.p[i] < clock.p[i]) {
-            my_clock.p[i] = clock.p[i];
-        }
-    }
-    printf("Processo %d recebeu: (%d, %d, %d)\n", pid, my_clock.p[0], my_clock.p[1], my_clock.p[2]);
-    pthread_mutex_unlock(&mtx_clock);
-}
-
-void send(int pid, int receiver) {
-    
-    pthread_mutex_lock(&mtx_clock);
-    my_clock.p[pid]++;
-    Clock temp = my_clock;
-    pthread_mutex_unlock(&mtx_clock);
-    
-    pthread_mutex_lock(&mtx_send); //bloqueia fila de envio
-    while (snd_count == BUFFER_SIZE){
-        printf("O BUFFER DE ENVIO DE %d ESTA VAZIO\n", pid);
-        pthread_cond_wait(&snd_full, &mtx_send); // Libera mutex mtx_send e fica bloqueado na variável snd_full
-    }
-    
-    temp.receiver = receiver;
-    snd[snd_count] = temp;
-    snd_count++;
-    printf("Processo %d enviou (%d, %d, %d) para o processo %d\n", pid, my_clock.p[0], my_clock.p[1], my_clock.p[2], receiver);
-    pthread_mutex_unlock(&mtx_send);//libera fila de envio
-    pthread_cond_signal(&snd_empty); //desbloqueia thread 3
-}
-
-/* -----------------------------------------------------------------------------*/
-
+//gerencia o recebimento, comparação e envio de relogios
 void* mainThread(void* args) {
-    long my_rank = (long) args;
-    int finalizado = 0;
+    int my_rank = (int)((long)args);
     
-    if(finalizado == 2){
-        pthread_mutex_unlock(&mtx_rcv);
-        pthread_cond_signal(&rcv_empty);
-        
-        pthread_cond_signal(&snd_full);
-    }
-
     if (my_rank == 0) {
         event(0);
-        send(0,1);
-        receive(0);
-        send(0,2);
-        receive(0);
-        send(0,1);
+        queueSnd(0, 1);
+        compare(0);
+        queueSnd(0,2);
+        compare(0);
+        queueSnd(0, 1);
         event(0);
-        printf("%d -> (%d,%d,%d)\n",0,my_clock.p[0], my_clock.p[1],my_clock.p[2]);
-        finalizado++;
-
+        printMyClock(0);
     } else if (my_rank == 1) {
-        send(1,0);
-        receive(1);
-        receive(1);
-        printf("%d -> (%d,%d,%d)\n",1,my_clock.p[0], my_clock.p[1],my_clock.p[2]);
-        finalizado++;
-
+        queueSnd(1,0);
+        compare(1);
+        compare(1);
+        printMyClock(1);
     } else if (my_rank == 2) {
         event(2);
-        send(2,0);
-        receive(2);
-        printf("%d -> (%d,%d,%d)\n",2,my_clock.p[0], my_clock.p[1],my_clock.p[2]);
-        finalizado++;
+        queueSnd(2,0);
+        compare(2);
+        printMyClock(2);
     }
+
     return NULL;
 }
 
-void* receiveClock(void* args) {
-    long my_rank = (long) args;
-    
-   while(1) {
-    
-        pthread_mutex_lock(&mtx_rcv);//bloqueia mutex da fila de recebimento
-    
-        while (rcv_count == BUFFER_SIZE){
-            //printf("O BUFFER DE RECEBIMENTO ESTA CHEIO\n");
-            pthread_cond_wait(&rcv_full, &mtx_rcv); // Libera mutex mtx_rcv e fica bloqueado na variável rcv_full
-        }
-        
-        MPI_Status status;
-        MPI_Recv(&rcv[rcv_count], sizeof(struct Clock), MPI_BYTE, MPI_ANY_SOURCE, 0, MPI_COMM_WORLD, &status);
-        Clock c = rcv[rcv_count];
-        rcv_count++;
-        //printf("processo %d recebeu relógio (%d,%d,%d) do processo %d\n",(int) my_rank,c.p[0],c.p[1],c.p[2], status.MPI_SOURCE);
+//envia relogios que estiverem na fila de envio
+void* sendingThread(void* args) {
+    int my_rank = (int)((long)args);
+    Clock clock;
+    int receiver;
 
-        pthread_mutex_unlock(&mtx_rcv);//desbloqueia mutex da fila de recebimento
-        pthread_cond_signal(&rcv_empty);//desbloqueia thread 2
-   }
-    
-    return NULL;
-}
-
-void* sendClock(void* args) {
-    long my_rank = (long) args;
-    
-   while(1) {
-    
-        pthread_mutex_lock(&mtx_send);//bloqueia mutex da fila de envio
-
-        while (snd_count == 0){
-            //printf("O BUFFER DE ENVIO ESTA VAZIO\n");
-            pthread_cond_wait(&snd_empty, &mtx_send); // Libera mutex mtx_send e fica bloqueado na variável snd_empty
-        }
-   
-        Clock clock = snd[0];
-        for (int i = 0; i < snd_count - 1; i++) {
-            snd[i] = snd[i + 1];
-        }
-        snd_count--;
-        //printf("processo %d enviando relógio (%d,%d,%d) para %d\n", (int)my_rank, clock.p[0],clock.p[1],clock.p[2], clock.receiver);
-
-    
-        pthread_mutex_unlock(&mtx_send); //desbloqueia mutex da fila de envio
-        pthread_cond_signal(&snd_full); //desbloqueia thread 2
-    
-        MPI_Send(&clock, sizeof(Clock), MPI_BYTE, clock.receiver, 0, MPI_COMM_WORLD);
+    while (1) {
+        clock = send();
+        receiver = clock.receiver;
+        MPI_Send(&clock, sizeof(Clock), MPI_BYTE, receiver, 0, MPI_COMM_WORLD);
+        printf("%d sent clock (%d,%d,%d) to %d\n", my_rank, clock.p[0], clock.p[1], clock.p[2], receiver);
     }
+
     return NULL;
 }
