@@ -47,12 +47,13 @@ Clock my_clock = {{0, 0, 0}, -1};
 
 //processo mostra seu próprio relógio (debug)
 void printMyClock(int pid) {
-    printf("%d: my clock is (%d,%d,%d)\n", pid, my_clock.p[0], my_clock.p[1], my_clock.p[2]);
+    printf("%d -> (%d,%d,%d)\n",pid,my_clock.p[0], my_clock.p[1],my_clock.p[2]);
 
 }
 //evento do processo pid
 void event(int pid) {
     my_clock.p[pid]++;
+    printf("Processo %d fez evento: (%d, %d, %d)\n", pid, my_clock.p[0], my_clock.p[1], my_clock.p[2]);
 }
 
 //salva relógio recebido como parametro na fila de recebidos
@@ -195,6 +196,7 @@ void* receivingThread(void* args) {
     while (1) {
         MPI_Recv(&clock, sizeof(Clock), MPI_BYTE, MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
         queueRcv(clock);
+        printf("Processo %d recebeu: (%d, %d, %d)\n", my_rank, my_clock.p[0], my_clock.p[1], my_clock.p[2]);
     }
 
     return NULL;
@@ -238,7 +240,7 @@ void* sendingThread(void* args) {
         clock = send();
         receiver = clock.receiver;
         MPI_Send(&clock, sizeof(Clock), MPI_BYTE, receiver, 0, MPI_COMM_WORLD);
-        printf("%d sent clock (%d,%d,%d) to %d\n", my_rank, clock.p[0], clock.p[1], clock.p[2], receiver);
+        printf("Processo %d enviou (%d, %d, %d) para o processo %d\n", my_rank, my_clock.p[0], my_clock.p[1], my_clock.p[2], receiver);
     }
 
     return NULL;
